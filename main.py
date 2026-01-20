@@ -32,8 +32,9 @@ class SobeyTemplate1PdfParser:
     # Template 1 regex: Single pickup/delivery date, Stop 2 for ship-to
     REGEX_TEMPLATE1 = r"(\d+)\s+-\s+(.*)\s*Cube\s*:\s*([0-9,]+)\s*Weight\s*:\s*([0-9,]+)\s*Pieces\s*:\s*([0-9,]+)\s*[A-Z]{3}-PO-\d{2}-\d{4}-(\d+).*\s+Ref\s*Number:.*\s*Pallet\s*Count:(.*)\s*(.*)"
     
-    # Template 2 regex
-    REGEX_TEMPLATE2 = r"(?<!\d)(\d{5,})(?!\s*-\s*\d+\s+ST)\s+-\s+(.*?)\s+Cube\s*:\s*([0-9,]+)\s+Weight\s*:\s*([0-9,]+)\s+Pieces\s*:\s*([0-9,]+)\s+[A-Z]{3}-PO-\d{2}-\d{4}-(\d+)"
+    # Template 2 regex - FIXED to be more precise
+    # Must match: vendor number, vendor name (non-greedy), then Cube/Weight/Pieces, then PO
+    REGEX_TEMPLATE2 = r"(\d{6})\s+-\s+([^C]+?)\s+Cube\s*:\s*([0-9,]+)\s+Weight\s*:\s*([0-9,]+)\s+Pieces\s*:\s*([0-9,]+)\s+[A-Z]{3}-PO-\d{2}-\d{4}-(\d+)"
     
     def __init__(self):
         pass
@@ -108,7 +109,8 @@ class SobeyTemplate1PdfParser:
         Extracts the shipment type from the PO number
         Example: "AMS-PO-10-2025-4610227518 (GROC)" returns "GROC"
         """
-        pattern = re.compile(rf'[A-Z]{{3}}-PO-\d{{2}}-\d{{4}}-{po_number}\s*\(([^)]+)\)')
+        # More flexible pattern - handle extra spaces
+        pattern = re.compile(rf'[A-Z]{{3}}-PO-\d{{2}}-\d{{4}}-{po_number}\s*\(([^)]+)\)', re.IGNORECASE)
         match = pattern.search(text)
         if match:
             return match.group(1).strip()
@@ -116,6 +118,7 @@ class SobeyTemplate1PdfParser:
     
     def detect_template(self, text: str) -> str:
         """Detect which template is being used"""
+        # Look for "Pickup :" or "Pickup:" with date pattern
         template2_pattern = re.compile(r'Pickup\s*:\s*\w{3}\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}:\d{2}')
         
         if template2_pattern.search(text):
@@ -128,7 +131,7 @@ class SobeyTemplate1PdfParser:
     def extract_stop_destinations(self, text: str) -> List[str]:
         """Extract stop destinations from the PDF text"""
         destinations = []
-        stop_pattern = re.compile(r'(?s)Stop:\s*(\d+)\s*Destination:\s*(.*?)\s*Stop Location Memo:')
+        stop_pattern = re.compile(r'(?s)Stop:\s*(\d+)\s*Destination:\s*(.*?)\s*Stop Location Memo:', re.IGNORECASE)
         
         for match in stop_pattern.finditer(text):
             stop_number = int(match.group(1))
@@ -159,9 +162,57 @@ class SobeyTemplate1PdfParser:
         records = []
         pattern = re.compile(self.REGEX_TEMPLATE1)
         
+        # Extract pickup and delivery dates for Template-1 (format: "Pickup On : DD/MM/YYYY")
+        pickup_on_pattern = re.compile(r'Pickup\s+On\s*:\s*(\d{2}/\d{2}/\d{4})', re.IGNORECASE)
+        deliver_on_pattern = re.compile(r'Deliver\s+On\s*:\s*(\d{2}/\d{2}/\d{4})', re.IGNORECASE)
+        
+        pickup_date_match = pickup_on_pattern.search(text)
+        deliver_date_match = deliver_on_pattern.search(text)
+        
+        pickup_date = pickup_date_match.group(1) if pickup_date_match else ""
+        del_date = deliver_date_match.group(1) if deliver_date_match else ""
+        
+        log.info(f"Template-1: Found pickup_date={pickup_date}, del_date={del_date}")
+        
+        # Extract ship_from from Stop 1 (index 0)
+        ship_from = ""
+        if len(stop_destinations) > 0:
+            ship_from = stop_destinations[0]  # Stop 1 is at index 0
+            log.info(f"Template-1: Using Stop 1 as ship_from: {ship_from}")
+        
+        # Extract ship_to from Stop 2 (index 1)
+        ship_to = ""
+        if len(stop_destinations) > 1:
+            ship_to = stop_destinations[1]  # Stop 2 is at index 1
+            log.info(f"Template-1: Using Stop 2 as ship_to: {ship_to}")
+        
         for match in pattern.finditer(text):
+            # Extract description from Pallet Count (group 7)
+            description = match.group(7).strip() if match.group(7) else ''
+            
+            # Remove trailing pipe character if present
+            if description:
+                description = description.rstrip('|').strip()
+            
+            # If description is still empty, try to extract it directly from text near the PO
+            if not description:
+                po_number = match.group(6)
+                # Look for Pallet Count near the PO number
+                po_context_pattern = re.compile(
+                    rf'{re.escape(po_number)}[\s\S]*?Pallet\s+Count:\s*([^\n|]+?)(?=\s*[|]|\s*Cube|\s*Weight|$)',
+                    re.IGNORECASE | re.MULTILINE
+                )
+                po_context_match = po_context_pattern.search(text)
+                if po_context_match:
+                    description = po_context_match.group(1).strip()
+                    log.info(f"Template-1: Extracted description from context: {description}")
+            
             record = {
                 'template': 'Template-1',
+                'pickup_date': pickup_date,
+                'del_date': del_date,
+                'ship_from': ship_from,
+                'ship_to': ship_to,
                 'vendor_no': match.group(1),
                 'vendor_name': self.extract_vendor_name(match.group(2)),
                 'cubes': match.group(3),
@@ -170,12 +221,8 @@ class SobeyTemplate1PdfParser:
                 'po': match.group(6),
                 'shipment_type': self.extract_shipment_type(text, match.group(6)),
                 'pallets': '',
-                'description': match.group(7).strip() if match.group(7) else ''
+                'description': description
             }
-            
-            # Clean up Stop: 2 if present
-            if 'ship_to' in record and record['ship_to']:
-                record['ship_to'] = record['ship_to'].replace("Stop: 2", "")
             
             records.append(record)
         
@@ -185,19 +232,27 @@ class SobeyTemplate1PdfParser:
         """Process Template 2 PDF"""
         records = []
         
-        # Extract line items
+        # FIXED: Extract line items with better regex that handles line breaks
         line_items = []
-        pattern = re.compile(self.REGEX_TEMPLATE2, re.DOTALL)
         
-        for match in pattern.finditer(text):
+        # Pattern that allows vendor name to span multiple lines
+        # Uses [\s\S]*? to match any character including newlines (non-greedy)
+        # Stops when it encounters "Cube" (with optional whitespace before it)
+        shipment_pattern = re.compile(
+            r'(\d{6})\s+-\s+([\s\S]+?)(?=\s*Cube\s*:)\s*Cube\s*:\s*([0-9,]+)\s+Weight\s*:\s*([0-9,]+)\s+Pieces\s*:\s*([0-9,]+)\s+([A-Z]{3}-PO-\d{2}-\d{4}-(\d+))',
+            re.MULTILINE
+        )
+        
+        for match in shipment_pattern.finditer(text):
             item = LineItemData()
             item.vendor_no = match.group(1)
             raw_vendor_name = match.group(2)
+            # Clean up vendor name - collapse all whitespace including newlines into single spaces
             item.vendor_name = re.sub(r'\s+', ' ', raw_vendor_name).strip()
             item.cubes = match.group(3)
             item.weight = match.group(4)
             item.pieces = match.group(5)
-            item.po = match.group(6)
+            item.po = match.group(7)  # PO number from group 7
             item.match_end = match.end()
             
             log.info(f"Captured line item: VendorNo={item.vendor_no}, VendorName={item.vendor_name}, PO={item.po}")
@@ -206,7 +261,7 @@ class SobeyTemplate1PdfParser:
         log.info(f"Found {len(line_items)} line items in Template-2")
         
         # Extract pallet count data (product descriptions)
-        pallet_pattern = re.compile(r'Pallet\s+Count:\s*([^\n]*?)\s*(?:Pickup|$)', re.DOTALL)
+        pallet_pattern = re.compile(r'Pallet\s+Count:\s*([^\n]+?)(?=\s*(?:Pickup|Delivery|$))', re.MULTILINE | re.DOTALL)
         pallet_data = []
         for match in pallet_pattern.finditer(text):
             pallet = match.group(1).strip()
@@ -214,14 +269,22 @@ class SobeyTemplate1PdfParser:
                 log.info(f"Captured pallet data: {pallet}")
                 pallet_data.append(pallet)
         
-        # Extract pickup and delivery dates
-        pickup_pattern = re.compile(r'Pickup\s*:\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM))')
-        deliver_pattern = re.compile(r'Deliver(?:y)?\s*:?\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4}[\s\S]*?\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM))')
+        # Extract pickup dates - handle both "Pickup :" and "Pickup:"
+        pickup_pattern = re.compile(r'Pickup\s*:\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM))', re.IGNORECASE)
+        
+        # Extract delivery dates - handle "Deliver :", "Delivery :", and variations
+        deliver_pattern = re.compile(r'Deliver(?:y)?\s*:\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4}[\s\S]*?\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM))', re.IGNORECASE)
         
         pickup_dates = [match.group(1) for match in pickup_pattern.finditer(text)]
         delivery_dates = [re.sub(r'\s+', ' ', match.group(1)).strip() for match in deliver_pattern.finditer(text)]
         
         log.info(f"Found {len(pickup_dates)} pickup dates and {len(delivery_dates)} delivery dates")
+        
+        # Extract ship_from from Stop 1 (index 0) for Template-2
+        ship_from = ""
+        if len(stop_destinations) > 0:
+            ship_from = stop_destinations[0]  # Stop 1 is at index 0
+            log.info(f"Template-2: Using Stop 1 as ship_from: {ship_from}")
         
         # Process each line item
         for idx, item in enumerate(line_items):
@@ -243,7 +306,7 @@ class SobeyTemplate1PdfParser:
                 log.info(f"Extracted stop number '{vendor_stop_num}' from vendor name: {item.vendor_name}")
                 
                 # Find matching stop destination
-                for stop_idx in range(1, len(stop_destinations)):
+                for stop_idx in range(len(stop_destinations)):
                     stop_dest = stop_destinations[stop_idx]
                     stop_num_pattern = re.compile(r'^(\d+),')
                     stop_num_match = stop_num_pattern.search(stop_dest)
@@ -253,17 +316,27 @@ class SobeyTemplate1PdfParser:
                             ship_to = stop_dest
                             log.info(f"Matched vendor stop '{vendor_stop_num}' with destination stop: {stop_dest}")
                             break
+                
+                if not ship_to:
+                    log.warning(f"No matching destination found for stop number: {vendor_stop_num}")
+            else:
+                log.warning(f"Could not extract stop number from vendor name: {item.vendor_name}")
             
             # Get description from pallet data
             description = pallet_data[idx] if idx < len(pallet_data) else ""
             
             # Extract clean vendor name
             clean_vendor_name = self.extract_vendor_name(item.vendor_name)
+            log.info(f"Processing line item {idx}: Full vendor='{item.vendor_name}' -> Clean vendor='{clean_vendor_name}'")
+            
+            # Extract shipment type from PO
+            shipment_type = self.extract_shipment_type(text, item.po)
             
             record = {
                 'template': 'Template-1',  # Hardcoded as per original Java code
                 'del_date': formatted_delivery_date,
                 'pickup_date': formatted_pickup_date,
+                'ship_from': ship_from,
                 'ship_to': ship_to,
                 'vendor_no': item.vendor_no,
                 'vendor_name': clean_vendor_name,
@@ -271,7 +344,7 @@ class SobeyTemplate1PdfParser:
                 'weight': item.weight,
                 'pieces': item.pieces,
                 'po': item.po,
-                'shipment_type': self.extract_shipment_type(text, item.po),
+                'shipment_type': shipment_type,
                 'pallets': '',
                 'description': description
             }
